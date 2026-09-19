@@ -19,7 +19,8 @@ const ASSET_BASE = 'https://raw.githubusercontent.com/gthawani-del/MumbaikartRac
 const ASSETS = {
   auto: `${ASSET_BASE}/mumbai-racing-auto.glb`,
   streetlight: `${ASSET_BASE}/streetlight.glb`,
-  palm: `${ASSET_BASE}/palm-tree.glb`
+  palm: `${ASSET_BASE}/palm-tree.glb`,
+  environment: `${ASSET_BASE}/mumbai-environment-kit.glb`
 };
 
 const OSM_ENDPOINTS = [
@@ -551,6 +552,77 @@ async function addStreetFurniture() {
   await Promise.allSettled([streetlightTask, palmTask]);
 }
 
+
+async function addAuthoredEnvironment() {
+  const marine = FALLBACK_WAYS.find((way) => (way.tags.name ?? '').toLowerCase().includes('marine drive'));
+  if (!marine) return;
+  const path = marine.geometry.map(worldPoint);
+
+  try {
+    const gltf = await new GLTFLoader().loadAsync(ASSETS.environment);
+    const authored = new THREE.Group();
+    authored.name = 'Authored Mumbai environment';
+
+    const cloneModule = (name: string, scale: number) => {
+      const source = gltf.scene.getObjectByName(name);
+      if (!source) return null;
+
+      const module = source.clone(true);
+      module.scale.setScalar(scale);
+      module.updateMatrixWorld(true);
+
+      const bounds = new THREE.Box3().setFromObject(module);
+      const center = bounds.getCenter(new THREE.Vector3());
+      module.position.x -= center.x;
+      module.position.y -= bounds.min.y;
+      module.position.z -= center.z;
+
+      module.traverse((object) => {
+        if (object instanceof THREE.Mesh) {
+          object.castShadow = false;
+          object.receiveShadow = true;
+        }
+      });
+
+      return module;
+    };
+
+    const buildingNames = ['ArtDeco_Cream', 'ArtDeco_Teal', 'ArtDeco_Coral'];
+    const buildingCount = 15;
+    for (let i = 0; i < buildingCount; i++) {
+      const module = cloneModule(buildingNames[i % buildingNames.length], 0.82 + (i % 3) * 0.05);
+      if (!module) continue;
+      const pose = samplePath(path, (i + 0.35) / buildingCount);
+      module.position.add(pose.position).addScaledVector(pose.inland, 24 + (i % 3) * 5);
+      module.rotation.y = Math.atan2(pose.inland.x, pose.inland.z);
+      authored.add(module);
+    }
+
+    const promenadeCount = 18;
+    for (let i = 0; i < promenadeCount; i++) {
+      const module = cloneModule('Promenade_Module', 0.56);
+      if (!module) continue;
+      const pose = samplePath(path, (i + 0.5) / promenadeCount);
+      module.position.add(pose.position).addScaledVector(pose.inland, -8.3);
+      module.quaternion.setFromUnitVectors(new THREE.Vector3(1, 0, 0), pose.tangent);
+      authored.add(module);
+    }
+
+    for (const t of [0.18, 0.49, 0.78]) {
+      const module = cloneModule('BusStop_Module', 0.86);
+      if (!module) continue;
+      const pose = samplePath(path, t);
+      module.position.add(pose.position).addScaledVector(pose.inland, 13);
+      module.rotation.y = Math.atan2(pose.inland.x, pose.inland.z);
+      authored.add(module);
+    }
+
+    root.add(authored);
+  } catch {
+    // Authored environment is enhancement-only; roads remain playable.
+  }
+}
+
 function createKart() {
   const g = new THREE.Group();
   const yellow = new THREE.MeshStandardMaterial({ color: 0xf0b12f, roughness: 0.42, metalness: 0.14 });
@@ -710,6 +782,7 @@ async function boot() {
     kartMesh = createKart();
     void upgradeKartVisual(kartMesh);
     void addStreetFurniture();
+    void addAuthoredEnvironment();
     setupPhysics();
     kartMesh.position.copy(spawn);
 
