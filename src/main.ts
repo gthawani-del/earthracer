@@ -76,6 +76,10 @@ let kartMesh: THREE.Group;
 let spawn = new THREE.Vector3(0, 1.25, 0);
 let spawnYaw = 0;
 let running = false;
+let activeRoads: RoadWay[] = [];
+let lastSafePosition = new THREE.Vector3();
+let lastSafeYaw = 0;
+let offRoadSeconds = 0;
 const keys = new Set<string>();
 
 addEventListener('keydown', (e) => { keys.add(e.code); if (e.code === 'KeyR') resetKart(); });
@@ -386,6 +390,7 @@ function addBaseWorld() {
 }
 
 function buildRoadWorld(roads: RoadWay[]) {
+  activeRoads = roads;
   mapRoot.clear();
   addBaseWorld();
 
@@ -623,6 +628,123 @@ async function addAuthoredEnvironment() {
   }
 }
 
+
+function pointToSegmentDistance2D(point: THREE.Vector3, a: THREE.Vector3, b: THREE.Vector3) {
+  const abx = b.x - a.x;
+  const abz = b.z - a.z;
+  const apx = point.x - a.x;
+  const apz = point.z - a.z;
+  const lenSq = abx * abx + abz * abz;
+
+  if (lenSq < 0.0001) {
+    const dx = point.x - a.x;
+    const dz = point.z - a.z;
+    return { distance: Math.hypot(dx, dz), point: a.clone(), tangent: new THREE.Vector3(0, 0, -1) };
+  }
+
+  const t = THREE.MathUtils.clamp((apx * abx + apz * abz) / lenSq, 0, 1);
+  const nearest = new THREE.Vector3(a.x + abx * t, 0, a.z + abz * t);
+  const tangent = new THREE.Vector3(abx, 0, abz).normalize();
+  return {
+    distance: Math.hypot(point.x - nearest.x, point.z - nearest.z),
+    point: nearest,
+    tangent
+  };
+}
+
+function nearestRoadState(point: THREE.Vector3) {
+  let bestDistance = Infinity;
+  let bestRoad: RoadWay | null = null;
+  let bestPoint = new THREE.Vector3();
+  let bestTangent = new THREE.Vector3(0, 0, -1);
+
+  for (const road of activeRoads) {
+    for (let i = 0; i < road.pts.length - 1; i++) {
+      const hit = pointToSegmentDistance2D(point, road.pts[i], road.pts[i + 1]);
+      if (hit.distance < bestDistance) {
+        bestDistance = hit.distance;
+        bestRoad = road;
+        bestPoint.copy(hit.point);
+        bestTangent.copy(hit.tangent);
+      }
+    }
+  }
+
+  return {
+    road: bestRoad,
+    centerDistance: bestDistance,
+    outsideDistance: bestRoad ? Math.max(0, bestDistance - bestRoad.width / 2) : Infinity,
+    point: bestPoint,
+    tangent: bestTangent
+  };
+}
+
+function currentYaw() {
+  const r = kartBody.rotation();
+  const q = new THREE.Quaternion(r.x, r.y, r.z, r.w);
+  const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(q).setY(0).normalize();
+  return Math.atan2(-forward.x, -forward.z);
+}
+
+function recoverToLastSafeRoad() {
+  if (!kartBody) return;
+  const position = lastSafePosition.lengthSq() > 0.01 ? lastSafePosition : spawn;
+  const yaw = lastSafePosition.lengthSq() > 0.01 ? lastSafeYaw : spawnYaw;
+
+  kartBody.setTranslation({ x: position.x, y: 1.25, z: position.z }, true);
+  kartBody.setRotation({ x: 0, y: Math.sin(yaw / 2), z: 0, w: Math.cos(yaw / 2) }, true);
+  kartBody.setLinvel({ x: 0, y: 0, z: 0 }, true);
+  kartBody.setAngvel({ x: 0, y: 0, z: 0 }, true);
+  offRoadSeconds = 0;
+
+  const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+  camera.position.copy(position).add(new THREE.Vector3(0, 4.8, 10.2).applyQuaternion(q));
+  camera.lookAt(position.clone().add(new THREE.Vector3(0, 0.78, -10).applyQuaternion(q)));
+}
+
+function updateRoadSafety(dt: number) {
+  if (!kartBody || !activeRoads.length) return;
+
+  const p = kartBody.translation();
+  if (![p.x, p.y, p.z].every(Number.isFinite)) {
+    recoverToLastSafeRoad();
+    return;
+  }
+
+  const position = new THREE.Vector3(p.x, 0, p.z);
+  const state = nearestRoadState(position);
+
+  if (state.outsideDistance <= 1.2) {
+    offRoadSeconds = 0;
+    lastSafePosition.copy(state.point).setY(1.25);
+    lastSafeYaw = currentYaw();
+    return;
+  }
+
+  offRoadSeconds += dt;
+
+  const velocity = kartBody.linvel();
+  const drag = state.outsideDistance > 5 ? 0.78 : 0.9;
+  kartBody.setLinvel({
+    x: velocity.x * drag,
+    y: velocity.y,
+    z: velocity.z * drag
+  }, true);
+
+  // Mild steering pull toward the nearest street before hard recovery.
+  if (state.outsideDistance < 14 && state.point.lengthSq() > 0) {
+    const toward = state.point.clone().sub(position).setY(0);
+    if (toward.lengthSq() > 0.01) {
+      toward.normalize();
+      kartBody.addForce({ x: toward.x * 420, y: 0, z: toward.z * 420 }, true);
+    }
+  }
+
+  if (state.outsideDistance > 22 || offRoadSeconds > 2.5 || p.y < -2.5) {
+    recoverToLastSafeRoad();
+  }
+}
+
 function createKart() {
   const g = new THREE.Group();
   const yellow = new THREE.MeshStandardMaterial({ color: 0xf0b12f, roughness: 0.42, metalness: 0.14 });
@@ -673,6 +795,9 @@ function setupPhysics() {
 
 function resetKart() {
   if (!kartBody) return;
+  lastSafePosition.copy(spawn);
+  lastSafeYaw = spawnYaw;
+  offRoadSeconds = 0;
   kartBody.setTranslation(spawn, true);
   kartBody.setRotation({ x: 0, y: Math.sin(spawnYaw / 2), z: 0, w: Math.cos(spawnYaw / 2) }, true);
   kartBody.setLinvel({ x: 0, y: 0, z: 0 }, true);
@@ -715,7 +840,6 @@ function drive() {
   }
 
   speedEl.textContent = String(Math.round(kmh)).padStart(3, '0');
-  if (kartBody.translation().y < -3) resetKart();
 }
 
 function resize() {
@@ -735,6 +859,7 @@ function frame() {
     drive();
     physics.timestep = dt;
     physics.step();
+    updateRoadSafety(dt);
 
     const p = kartBody.translation();
     const r = kartBody.rotation();
@@ -784,6 +909,8 @@ async function boot() {
     void addStreetFurniture();
     void addAuthoredEnvironment();
     setupPhysics();
+    lastSafePosition.copy(spawn);
+    lastSafeYaw = spawnYaw;
     kartMesh.position.copy(spawn);
 
     const spawnQ = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), spawnYaw);
