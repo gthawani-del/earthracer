@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#071018" />
+    <title>EarthKart — Marine Drive POC</title>
+  </head>
+  <body>
+    <div id="app">
+      <div id="stage"></div>
+      <div id="loader" class="loader">
+        <div class="loader__brand">EARTHKART</div>
+        <div class="loader__place">Marine Drive · Mumbai</div>
+        <div class="loader__bar"><span id="loaderBar"></span></div>
+        <div class="loader__row"><span id="loaderStatus">Starting engine</span><strong id="loaderPct">0%</strong></div>
+      </div>
+      <header class="hud hud--top">
+        <div><span class="eyebrow">EARTHKART / POC 01</span><strong>MARINE DRIVE</strong></div>
+        <div class="hud__live"><i></i> LIVE OSM</div>
+      </header>
+      <section class="hud hud--speed">
+        <strong id="speed">000</strong><span>KM/H</span>
+      </section>
+      <section class="hud hud--controls">
+        <span>W / ↑ accelerate</span><span>S / ↓ brake</span><span>A D steer</span><span>R reset</span>
+      </section>
+      <section id="errorPanel" class="error-panel" hidden>
+        <strong>Map data did not load.</strong>
+        <span id="errorText"></span>
+        <button id="retryButton">Retry OSM</button>
+      </section>
+      <footer>
+        Real road geometry from <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">© OpenStreetMap contributors</a>
+      </footer>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
