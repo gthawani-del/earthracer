@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import RAPIER from '@dimforge/rapier3d-compat';
 import { FALLBACK_WAYS } from './fallbackMap';
 import './style.css';
@@ -14,6 +15,14 @@ const ROAD_BBOX = { s: 18.9220, w: 72.8145, n: 18.9585, e: 72.8370 };
 const BUILDING_BBOX = { s: 18.9260, w: 72.8160, n: 18.9560, e: 72.8320 };
 const ORIGIN = { lat: 18.9410, lon: 72.8240 };
 const MARINE_DRIVE_TARGET = worldPoint({ lat: 18.9448, lon: 72.8232 });
+const ASSET_BASE = 'https://raw.githubusercontent.com/gthawani-del/MumbaikartRacer/main/public/assets';
+const ASSETS = {
+  auto: `${ASSET_BASE}/mumbai-racing-auto.glb`,
+  environment: `${ASSET_BASE}/mumbai-environment-kit.glb`,
+  streetlight: `${ASSET_BASE}/streetlight.glb`,
+  palm: `${ASSET_BASE}/palm-tree.glb`
+};
+
 const OSM_ENDPOINTS = [
   'https://overpass-api.de/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter'
@@ -390,6 +399,184 @@ function buildRoadWorld(roads: RoadWay[]) {
   addLaneMarkings(roads);
 }
 
+
+function samplePath(pts: THREE.Vector3[], t: number) {
+  const lengths: number[] = [];
+  let total = 0;
+  for (let i = 0; i < pts.length - 1; i++) {
+    total += pts[i].distanceTo(pts[i + 1]);
+    lengths.push(total);
+  }
+  const target = THREE.MathUtils.clamp(t, 0, 1) * total;
+  let i = lengths.findIndex((n) => n >= target);
+  if (i < 0) i = pts.length - 2;
+  const before = i === 0 ? 0 : lengths[i - 1];
+  const seg = Math.max(0.001, lengths[i] - before);
+  const u = THREE.MathUtils.clamp((target - before) / seg, 0, 1);
+  const position = pts[i].clone().lerp(pts[i + 1], u);
+  const tangent = pts[i + 1].clone().sub(pts[i]).setY(0).normalize();
+  const inland = new THREE.Vector3(-tangent.z, 0, tangent.x);
+  return { position, tangent, inland };
+}
+
+function fitModelToHeight(model: THREE.Object3D, targetHeight: number) {
+  model.updateMatrixWorld(true);
+  const bounds = new THREE.Box3().setFromObject(model);
+  const size = bounds.getSize(new THREE.Vector3());
+  const center = bounds.getCenter(new THREE.Vector3());
+  const scale = targetHeight / Math.max(size.y, 0.001);
+  model.scale.setScalar(scale);
+  model.position.set(-center.x * scale, -bounds.min.y * scale, -center.z * scale);
+  model.traverse((object) => {
+    if (object instanceof THREE.Mesh) {
+      object.castShadow = true;
+      object.receiveShadow = true;
+      const materials = Array.isArray(object.material) ? object.material : [object.material];
+      materials.forEach((material) => {
+        if (material instanceof THREE.MeshStandardMaterial) {
+          material.envMapIntensity = 0.75;
+          material.roughness = Math.max(material.roughness, 0.38);
+          material.metalness = Math.min(material.metalness, 0.5);
+        }
+      });
+    }
+  });
+  return model;
+}
+
+async function upgradeKartVisual(host: THREE.Group) {
+  try {
+    const gltf = await new GLTFLoader().loadAsync(ASSETS.auto);
+    const model = fitModelToHeight(gltf.scene.clone(true), 1.75);
+    model.rotation.y = Math.PI;
+    host.children.forEach((child) => { child.visible = false; });
+    host.add(model);
+  } catch {
+    // Procedural kart remains as a zero-dependency fallback.
+  }
+}
+
+function firstMesh(root: THREE.Object3D) {
+  let result: THREE.Mesh | null = null;
+  root.traverse((object) => {
+    if (!result && object instanceof THREE.Mesh) result = object;
+  });
+  return result;
+}
+
+async function addAuthoredMumbaiAssets() {
+  const marine = FALLBACK_WAYS.find((way) => (way.tags.name ?? '').toLowerCase().includes('marine drive'));
+  if (!marine) return;
+  const path = marine.geometry.map(worldPoint);
+  const loader = new GLTFLoader();
+
+  const tasks: Promise<unknown>[] = [];
+
+  tasks.push(loader.loadAsync(ASSETS.streetlight).then((gltf) => {
+    const source = firstMesh(gltf.scene);
+    if (!source) return;
+    const bounds = new THREE.Box3().setFromObject(source);
+    const height = bounds.getSize(new THREE.Vector3()).y;
+    const scale = 4.7 / Math.max(height, 0.001);
+    const material = new THREE.MeshStandardMaterial({ color: 0x242b2d, metalness: 0.65, roughness: 0.34 });
+    const count = 28;
+    const instances = new THREE.InstancedMesh(source.geometry, material, count);
+    const matrix = new THREE.Matrix4();
+    const q = new THREE.Quaternion();
+    for (let i = 0; i < count; i++) {
+      const pose = samplePath(path, (i + 0.5) / count);
+      const p = pose.position.clone().addScaledVector(pose.inland, -6.8);
+      p.y = -bounds.min.y * scale + 0.08;
+      q.setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.atan2(pose.tangent.x, pose.tangent.z));
+      matrix.compose(p, q, new THREE.Vector3(scale, scale, scale));
+      instances.setMatrixAt(i, matrix);
+    }
+    instances.instanceMatrix.needsUpdate = true;
+    instances.castShadow = true;
+    root.add(instances);
+  }));
+
+  tasks.push(loader.loadAsync(ASSETS.palm).then((gltf) => {
+    const source = firstMesh(gltf.scene);
+    if (!source) return;
+    const bounds = new THREE.Box3().setFromObject(source);
+    const height = bounds.getSize(new THREE.Vector3()).y;
+    const scale = 5.6 / Math.max(height, 0.001);
+    const sourceMaterial = Array.isArray(source.material) ? source.material[0] : source.material;
+    const material = sourceMaterial instanceof THREE.Material ? sourceMaterial.clone() : new THREE.MeshLambertMaterial({ color: 0x456d45 });
+    const count = 12;
+    const instances = new THREE.InstancedMesh(source.geometry, material, count);
+    const matrix = new THREE.Matrix4();
+    const q = new THREE.Quaternion();
+    for (let i = 0; i < count; i++) {
+      const pose = samplePath(path, (i + 0.7) / count);
+      const p = pose.position.clone().addScaledVector(pose.inland, -10.5);
+      p.y = -bounds.min.y * scale + 0.04;
+      q.setFromAxisAngle(new THREE.Vector3(0, 1, 0), i * 2.399963);
+      const v = scale * (0.92 + (i % 4) * 0.035);
+      matrix.compose(p, q, new THREE.Vector3(v, v, v));
+      instances.setMatrixAt(i, matrix);
+    }
+    instances.instanceMatrix.needsUpdate = true;
+    root.add(instances);
+  }));
+
+  tasks.push(loader.loadAsync(ASSETS.environment).then((gltf) => {
+    const authored = new THREE.Group();
+    authored.name = 'Mumbai authored environment';
+
+    const cloneModule = (name: string, scale: number) => {
+      const source = gltf.scene.getObjectByName(name);
+      if (!source) return null;
+      const module = source.clone(true);
+      module.scale.setScalar(scale);
+      module.updateMatrixWorld(true);
+      const bounds = new THREE.Box3().setFromObject(module);
+      const center = bounds.getCenter(new THREE.Vector3());
+      module.position.set(-center.x, -bounds.min.y, -center.z);
+      module.traverse((o) => {
+        if (o instanceof THREE.Mesh) {
+          o.castShadow = false;
+          o.receiveShadow = true;
+        }
+      });
+      return module;
+    };
+
+    const buildingNames = ['ArtDeco_Cream', 'ArtDeco_Teal', 'ArtDeco_Coral'];
+    for (let i = 0; i < 18; i++) {
+      const module = cloneModule(buildingNames[i % buildingNames.length], 0.82 + (i % 3) * 0.05);
+      if (!module) continue;
+      const pose = samplePath(path, (i + 0.35) / 18);
+      module.position.add(pose.position).addScaledVector(pose.inland, 22 + (i % 3) * 5);
+      module.rotation.y += Math.atan2(pose.tangent.x, pose.tangent.z);
+      authored.add(module);
+    }
+
+    for (let i = 0; i < 18; i++) {
+      const module = cloneModule('Promenade_Module', 0.56);
+      if (!module) continue;
+      const pose = samplePath(path, (i + 0.5) / 18);
+      module.position.add(pose.position).addScaledVector(pose.inland, -8.2);
+      module.rotation.y += Math.atan2(pose.tangent.x, pose.tangent.z);
+      authored.add(module);
+    }
+
+    for (const t of [0.18, 0.49, 0.78]) {
+      const module = cloneModule('BusStop_Module', 0.86);
+      if (!module) continue;
+      const pose = samplePath(path, t);
+      module.position.add(pose.position).addScaledVector(pose.inland, 13);
+      module.rotation.y += Math.atan2(pose.tangent.x, pose.tangent.z);
+      authored.add(module);
+    }
+
+    root.add(authored);
+  }));
+
+  await Promise.allSettled(tasks);
+}
+
 function createKart() {
   const g = new THREE.Group();
   const yellow = new THREE.MeshStandardMaterial({ color: 0xf0b12f, roughness: 0.42, metalness: 0.14 });
@@ -547,6 +734,8 @@ async function boot() {
 
     progress(72, 'Preparing kart');
     kartMesh = createKart();
+    void upgradeKartVisual(kartMesh);
+    void addAuthoredMumbaiAssets();
     setupPhysics();
     kartMesh.position.copy(spawn);
 
