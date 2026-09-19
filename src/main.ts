@@ -437,14 +437,33 @@ function fitModelToHeight(model: THREE.Object3D, targetHeight: number) {
 }
 
 async function upgradeKartVisual(host: THREE.Group) {
+  // Keep the vehicle hidden behind the loader until the authored auto is ready.
+  // This prevents a one-frame flash of the procedural fallback.
+  host.visible = false;
+
   try {
-    const gltf = await new GLTFLoader().loadAsync(ASSETS.auto);
+    const loader = new GLTFLoader();
+    const gltf = await Promise.race([
+      loader.loadAsync(ASSETS.auto),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Auto asset timeout')), 6500)
+      )
+    ]);
+
     const model = fitModelToHeight(gltf.scene.clone(true), 1.75);
-    model.rotation.y = Math.PI;
-    host.children.forEach((child) => { child.visible = false; });
+
+    // EarthKart physics faces local -Z. This GLB already faces that direction,
+    // so no 180-degree correction is required.
+    model.rotation.y = 0;
+
+    // Remove the procedural placeholder completely before revealing gameplay.
+    host.clear();
     host.add(model);
   } catch {
-    // Keep the procedural kart when the remote asset is unavailable.
+    // If the GLB fails, reveal the lightweight procedural fallback only after
+    // the loader has completed — never as a transient flash.
+  } finally {
+    host.visible = true;
   }
 }
 
@@ -903,11 +922,16 @@ async function boot() {
     const fallbackRoads = parseRoads(FALLBACK_WAYS, true);
     buildRoadWorld(fallbackRoads);
 
-    progress(72, 'Preparing kart');
+    progress(68, 'Preparing kart');
     kartMesh = createKart();
-    void upgradeKartVisual(kartMesh);
+
+    progress(76, 'Loading Mumbai racing auto');
+    await upgradeKartVisual(kartMesh);
+
+    progress(86, 'Preparing environment');
     void addStreetFurniture();
     void addAuthoredEnvironment();
+
     setupPhysics();
     lastSafePosition.copy(spawn);
     lastSafeYaw = spawnYaw;
