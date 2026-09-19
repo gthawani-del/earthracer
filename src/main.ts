@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import RAPIER from '@dimforge/rapier3d-compat';
+import { FALLBACK_WAYS } from './fallbackMap';
 import './style.css';
 
 type LL = { lat: number; lon: number };
@@ -9,10 +10,14 @@ type OSM = { elements?: Way[] };
 type RoadWay = { id: number; tags: Tags; pts: THREE.Vector3[]; width: number; main: boolean; length: number };
 type BuildingWay = { id: number; tags: Tags; pts: THREE.Vector3[] };
 
-const BBOX = { s: 18.9220, w: 72.8145, n: 18.9585, e: 72.8370 };
+const ROAD_BBOX = { s: 18.9220, w: 72.8145, n: 18.9585, e: 72.8370 };
+const BUILDING_BBOX = { s: 18.9260, w: 72.8160, n: 18.9560, e: 72.8320 };
 const ORIGIN = { lat: 18.9410, lon: 72.8240 };
 const MARINE_DRIVE_TARGET = worldPoint({ lat: 18.9448, lon: 72.8232 });
-const OSM_ENDPOINTS = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
+const OSM_ENDPOINTS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter'
+];
 
 const $ = <T extends Element>(q: string) => document.querySelector<T>(q)!;
 const stage = $('#stage');
@@ -21,6 +26,7 @@ const loaderBar = $('#loaderBar');
 const loaderStatus = $('#loaderStatus');
 const loaderPct = $('#loaderPct');
 const speedEl = $('#speed');
+const mapStatus = $('#mapStatus');
 const errorPanel = $('#errorPanel') as HTMLElement;
 const errorText = $('#errorText');
 $('#retryButton').addEventListener('click', () => location.reload());
@@ -51,6 +57,8 @@ sun.shadow.camera.far = 2000;
 scene.add(sun);
 
 const root = new THREE.Group();
+const mapRoot = new THREE.Group();
+root.add(mapRoot);
 scene.add(root);
 
 let physics: RAPIER.World;
@@ -97,21 +105,39 @@ function polylineLength(pts: THREE.Vector3[]) {
   return n;
 }
 
-async function loadOsm(): Promise<OSM> {
-  const q = `[out:json][timeout:30];(way["highway"](${BBOX.s},${BBOX.w},${BBOX.n},${BBOX.e});way["building"](${BBOX.s},${BBOX.w},${BBOX.n},${BBOX.e}););out geom tags;`;
-  let last: unknown;
-  for (const endpoint of OSM_ENDPOINTS) {
-    try {
-      const r = await fetch(`${endpoint}?data=${encodeURIComponent(q)}`, { headers: { Accept: 'application/json' } });
-      if (!r.ok) throw new Error(`OSM ${r.status}`);
-      const data = await r.json() as OSM;
-      if (!data.elements?.length) throw new Error('OSM returned no geometry');
-      return data;
-    } catch (e) {
-      last = e;
-    }
+function parseRoads(elements: Way[], setSpawn: boolean) {
+  const roads: RoadWay[] = [];
+
+  for (const way of elements) {
+    if (!way.geometry || way.geometry.length < 2 || !way.tags?.highway || !drivable(way.tags.highway)) continue;
+    const pts = way.geometry.map(worldPoint).filter((p, i, arr) => i === 0 || p.distanceTo(arr[i - 1]) > 0.25);
+    if (pts.length < 2) continue;
+
+    const length = polylineLength(pts);
+    if (length < 2) continue;
+
+    roads.push({
+      id: way.id,
+      tags: way.tags,
+      pts,
+      width: widthFor(way.tags.highway),
+      main: ['motorway', 'trunk', 'primary', 'secondary'].includes(way.tags.highway),
+      length
+    });
   }
-  throw last instanceof Error ? last : new Error('OSM unavailable');
+
+  if (!roads.length) throw new Error('No drivable streets found');
+  if (setSpawn) chooseSpawnRoad(roads);
+  return roads;
+}
+
+function parseBuildings(elements: Way[]) {
+  const buildings: BuildingWay[] = [];
+  for (const way of elements) {
+    if (!way.geometry || way.geometry.length < 4 || !way.tags?.building) continue;
+    buildings.push({ id: way.id, tags: way.tags, pts: way.geometry.map(worldPoint) });
+  }
+  return buildings;
 }
 
 function chooseSpawnRoad(roads: RoadWay[]) {
@@ -125,6 +151,7 @@ function chooseSpawnRoad(roads: RoadWay[]) {
     const classScore = roadClass === 'primary' ? 350 : roadClass === 'secondary' ? 220 : roadClass === 'tertiary' ? 80 : 0;
     const minDist = Math.min(...road.pts.map((p) => p.distanceTo(MARINE_DRIVE_TARGET)));
     const score = (namedMarineDrive ? 5000 : 0) + classScore + Math.min(road.length, 1200) - minDist * 0.75;
+
     if (score > bestScore) {
       bestScore = score;
       best = road;
@@ -150,35 +177,40 @@ function chooseSpawnRoad(roads: RoadWay[]) {
   spawnYaw = Math.atan2(-(b.x - a.x), -(b.z - a.z));
 }
 
-function parse(data: OSM) {
-  const roads: RoadWay[] = [];
-  const buildings: BuildingWay[] = [];
+function overpassFetch(query: string, timeoutMs: number) {
+  return Promise.any(OSM_ENDPOINTS.map(async (endpoint) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-  for (const way of data.elements ?? []) {
-    if (!way.geometry || way.geometry.length < 2) continue;
-
-    if (way.tags?.highway && drivable(way.tags.highway)) {
-      const pts = way.geometry.map(worldPoint).filter((p, i, arr) => i === 0 || p.distanceTo(arr[i - 1]) > 0.25);
-      if (pts.length < 2) continue;
-      const length = polylineLength(pts);
-      if (length < 2) continue;
-      roads.push({
-        id: way.id,
-        tags: way.tags,
-        pts,
-        width: widthFor(way.tags.highway),
-        main: ['motorway', 'trunk', 'primary', 'secondary'].includes(way.tags.highway),
-        length
+    try {
+      const r = await fetch(`${endpoint}?data=${encodeURIComponent(query)}`, {
+        headers: { Accept: 'application/json' },
+        signal: controller.signal
       });
-    } else if (way.tags?.building && way.geometry.length >= 4) {
-      const pts = way.geometry.map(worldPoint);
-      buildings.push({ id: way.id, tags: way.tags, pts });
+      if (!r.ok) throw new Error(`OSM ${r.status}`);
+      const data = await r.json() as OSM;
+      if (!data.elements?.length) throw new Error('OSM returned no geometry');
+      return data;
+    } finally {
+      clearTimeout(timer);
     }
-  }
+  }));
+}
 
-  if (!roads.length) throw new Error('No drivable streets found');
-  chooseSpawnRoad(roads);
-  return { roads, buildings };
+function loadLiveRoads() {
+  const b = ROAD_BBOX;
+  return overpassFetch(
+    `[out:json][timeout:12];way["highway"](${b.s},${b.w},${b.n},${b.e});out geom tags;`,
+    5000
+  );
+}
+
+function loadLiveBuildings() {
+  const b = BUILDING_BBOX;
+  return overpassFetch(
+    `[out:json][timeout:20];way["building"](${b.s},${b.w},${b.n},${b.e});out geom tags;`,
+    10000
+  );
 }
 
 function ribbonGeometry(pts: THREE.Vector3[], width: number, y: number) {
@@ -192,6 +224,7 @@ function ribbonGeometry(pts: THREE.Vector3[], width: number, y: number) {
     const tangent = next.clone().sub(prev).setY(0);
     if (tangent.lengthSq() < 0.0001) tangent.set(0, 0, 1);
     tangent.normalize();
+
     const normal = new THREE.Vector3(-tangent.z, 0, tangent.x);
     const left = pts[i].clone().addScaledVector(normal, half);
     const right = pts[i].clone().addScaledVector(normal, -half);
@@ -217,11 +250,12 @@ function addRoadLayer(roads: RoadWay[], extraWidth: number, y: number, material:
     mesh.receiveShadow = true;
     group.add(mesh);
   }
-  root.add(group);
+  mapRoot.add(group);
 }
 
-function junctions(roads: RoadWay[], extraWidth: number, y: number, material: THREE.Material) {
+function addJunctions(roads: RoadWay[], extraWidth: number, y: number, material: THREE.Material) {
   const nodes = new Map<string, { p: THREE.Vector3; r: number }>();
+
   for (const road of roads) {
     for (const p of road.pts) {
       const key = `${Math.round(p.x * 2)}:${Math.round(p.z * 2)}`;
@@ -235,15 +269,17 @@ function junctions(roads: RoadWay[], extraWidth: number, y: number, material: TH
   const mesh = new THREE.InstancedMesh(geo, material, nodes.size);
   const o = new THREE.Object3D();
   let i = 0;
+
   for (const node of nodes.values()) {
     o.position.set(node.p.x, y, node.p.z);
     o.scale.set(node.r, 1, node.r);
     o.updateMatrix();
     mesh.setMatrixAt(i++, o.matrix);
   }
+
   mesh.instanceMatrix.needsUpdate = true;
   mesh.receiveShadow = true;
-  root.add(mesh);
+  mapRoot.add(mesh);
 }
 
 function addLaneMarkings(roads: RoadWay[]) {
@@ -272,10 +308,16 @@ function addLaneMarkings(roads: RoadWay[]) {
   }
 
   if (!matrices.length) return;
-  const mesh = new THREE.InstancedMesh(cube, new THREE.MeshStandardMaterial({ color: 0xf0ead7, roughness: 0.7 }), matrices.length);
+
+  const mesh = new THREE.InstancedMesh(
+    cube,
+    new THREE.MeshStandardMaterial({ color: 0xf0ead7, roughness: 0.7 }),
+    matrices.length
+  );
+
   matrices.forEach((m, i) => mesh.setMatrixAt(i, m));
   mesh.instanceMatrix.needsUpdate = true;
-  root.add(mesh);
+  mapRoot.add(mesh);
 }
 
 function addBuildings(buildings: BuildingWay[]) {
@@ -290,7 +332,7 @@ function addBuildings(buildings: BuildingWay[]) {
       return size.x > 2 && size.z > 2 && size.x < 120 && size.z < 120 && b.center.distanceTo(spawn) < 950;
     })
     .sort((a, b) => a.center.distanceTo(spawn) - b.center.distanceTo(spawn))
-    .slice(0, 650);
+    .slice(0, 550);
 
   for (const b of nearby) {
     const outline = b.pts.slice(0, -1);
@@ -298,10 +340,8 @@ function addBuildings(buildings: BuildingWay[]) {
 
     const shape = new THREE.Shape();
     outline.forEach((p, i) => {
-      const sx = p.x;
-      const sy = -p.z;
-      if (i === 0) shape.moveTo(sx, sy);
-      else shape.lineTo(sx, sy);
+      if (i === 0) shape.moveTo(p.x, -p.z);
+      else shape.lineTo(p.x, -p.z);
     });
 
     const levels = Number(b.tags['building:levels'] ?? 0);
@@ -309,24 +349,15 @@ function addBuildings(buildings: BuildingWay[]) {
     const h = levels > 0 ? THREE.MathUtils.clamp(levels * 3.05, 4, 82) : 8 + hash * 22;
     const geometry = new THREE.ExtrudeGeometry(shape, { depth: h, bevelEnabled: false, steps: 1 });
     geometry.rotateX(-Math.PI / 2);
+
     const mesh = new THREE.Mesh(geometry, material);
     mesh.castShadow = false;
     mesh.receiveShadow = true;
-    root.add(mesh);
+    mapRoot.add(mesh);
   }
 }
 
-function addPromenade() {
-  const promenade = new THREE.Mesh(
-    new THREE.PlaneGeometry(235, 4200),
-    new THREE.MeshStandardMaterial({ color: 0xc9c0a9, roughness: 0.92 })
-  );
-  promenade.rotation.x = -Math.PI / 2;
-  promenade.position.set(-560, -0.01, 0);
-  root.add(promenade);
-}
-
-function buildCity(roads: RoadWay[], buildings: BuildingWay[]) {
+function addBaseWorld() {
   const ground = new THREE.Mesh(
     new THREE.PlaneGeometry(3600, 5200),
     new THREE.MeshStandardMaterial({ color: 0x69715f, roughness: 1 })
@@ -334,7 +365,7 @@ function buildCity(roads: RoadWay[], buildings: BuildingWay[]) {
   ground.rotation.x = -Math.PI / 2;
   ground.position.y = -0.09;
   ground.receiveShadow = true;
-  root.add(ground);
+  mapRoot.add(ground);
 
   const sea = new THREE.Mesh(
     new THREE.PlaneGeometry(1800, 5400),
@@ -342,20 +373,21 @@ function buildCity(roads: RoadWay[], buildings: BuildingWay[]) {
   );
   sea.rotation.x = -Math.PI / 2;
   sea.position.set(-1350, -0.035, 0);
-  root.add(sea);
+  mapRoot.add(sea);
+}
 
-  addPromenade();
+function buildRoadWorld(roads: RoadWay[]) {
+  mapRoot.clear();
+  addBaseWorld();
 
   const sidewalkMaterial = new THREE.MeshStandardMaterial({ color: 0xbeb6a2, roughness: 0.96 });
   const asphaltMaterial = new THREE.MeshStandardMaterial({ color: 0x303435, roughness: 0.81, metalness: 0.02 });
 
   addRoadLayer(roads, 3.4, 0.018, sidewalkMaterial);
-  junctions(roads, 3.4, 0.048, sidewalkMaterial);
+  addJunctions(roads, 3.4, 0.048, sidewalkMaterial);
   addRoadLayer(roads, 0, 0.083, asphaltMaterial);
-  junctions(roads, 0, 0.112, asphaltMaterial);
-
+  addJunctions(roads, 0, 0.112, asphaltMaterial);
   addLaneMarkings(roads);
-  addBuildings(buildings);
 }
 
 function createKart() {
@@ -435,7 +467,11 @@ function drive() {
 
   const lateral = v.dot(right);
   const grip = kmh > 70 ? 82 : 118;
-  kartBody.addForce({ x: -right.x * lateral * grip, y: -Math.min(750, kmh * 3.5), z: -right.z * lateral * grip }, true);
+  kartBody.addForce({
+    x: -right.x * lateral * grip,
+    y: -Math.min(750, kmh * 3.5),
+    z: -right.z * lateral * grip
+  }, true);
 
   if (steer && kmh > 1.5) {
     kartBody.addTorque({
@@ -482,35 +518,52 @@ function frame() {
 
 frame();
 
+async function hydrateLiveMap() {
+  try {
+    mapStatus.textContent = 'OSM SYNCING';
+    const osm = await loadLiveRoads();
+    const roads = parseRoads(osm.elements ?? [], false);
+    buildRoadWorld(roads);
+    mapStatus.textContent = 'LIVE OSM';
+
+    void loadLiveBuildings()
+      .then((buildingOsm) => addBuildings(parseBuildings(buildingOsm.elements ?? [])))
+      .catch(() => {
+        // Buildings are enhancement-only; never block gameplay.
+      });
+  } catch {
+    mapStatus.textContent = 'OFFLINE MAP';
+  }
+}
+
 async function boot() {
   try {
-    progress(7, 'Initialising WebGL');
+    progress(12, 'Initialising WebGL physics');
     await RAPIER.init();
 
-    progress(18, 'Loading Marine Drive street network');
-    const osm = await loadOsm();
+    progress(42, 'Loading local Marine Drive streets');
+    const fallbackRoads = parseRoads(FALLBACK_WAYS, true);
+    buildRoadWorld(fallbackRoads);
 
-    progress(45, 'Building connected OSM streets');
-    const city = parse(osm);
-    buildCity(city.roads, city.buildings);
-
-    progress(74, 'Snapping kart to Marine Drive');
+    progress(72, 'Preparing kart');
     kartMesh = createKart();
     setupPhysics();
     kartMesh.position.copy(spawn);
 
-    progress(92, `Loaded ${city.roads.length.toLocaleString()} street ways`);
     const spawnQ = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), spawnYaw);
     camera.position.copy(spawn).add(new THREE.Vector3(0, 4.8, 10.2).applyQuaternion(spawnQ));
     camera.lookAt(spawn.clone().add(new THREE.Vector3(0, 0.78, -10).applyQuaternion(spawnQ)));
 
-    progress(100, 'Ready');
+    progress(100, 'Drive');
+    mapStatus.textContent = 'LOCAL MAP';
     running = true;
-    setTimeout(() => loader.classList.add('is-done'), 180);
+    setTimeout(() => loader.classList.add('is-done'), 120);
+
+    void hydrateLiveMap();
   } catch (e) {
-    errorText.textContent = `${e instanceof Error ? e.message : String(e)}. Free public Overpass endpoints can occasionally rate-limit or time out.`;
+    errorText.textContent = e instanceof Error ? e.message : String(e);
     errorPanel.hidden = false;
-    progress(100, 'OSM unavailable');
+    progress(100, 'Startup error');
   }
 }
 
